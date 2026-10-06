@@ -41,7 +41,11 @@ const MODE_CONFIG: Record<TimerMode, ModeConfig> = {
 };
 
 function getTodayKey(): string {
-  return new Date().toISOString().split('T')[0];
+  const today = new Date();
+  const year = today.getFullYear();
+  const month = String(today.getMonth() + 1).padStart(2, '0');
+  const day = String(today.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 function loadStats(): TodayStats {
@@ -139,7 +143,11 @@ export default function App() {
     setIsRunning(false);
   }, [customDurations]);
 
-  const handleStart = () => setIsRunning(true);
+  const handleStart = () => {
+    if (timeLeft > 0) {
+      setIsRunning(true);
+    }
+  };
   const handlePause = () => setIsRunning(false);
   const handleReset = () => {
     setIsRunning(false);
@@ -243,9 +251,11 @@ export default function App() {
         {!isRunning ? (
           <button
             onClick={handleStart}
-            className={`px-8 py-3 rounded-full font-semibold text-white bg-gradient-to-r ${config.bgGradient} shadow-lg hover:shadow-xl hover:scale-105 transition-all duration-300 active:scale-95`}
+            disabled={timeLeft === 0}
+            className={`px-8 py-3 rounded-full font-semibold text-white bg-gradient-to-r ${config.bgGradient} shadow-lg hover:shadow-xl hover:scale-105 transition-all duration-300 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50`}
           >
-            <span className="mr-2">▶</span>開始
+            {timeLeft > 0 && <span className="mr-2">▶</span>}
+            {timeLeft > 0 ? '開始' : '已完成'}
           </button>
         ) : (
           <button
