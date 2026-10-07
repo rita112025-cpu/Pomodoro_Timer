@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-type TimerMode = 'focus' | 'shortBreak' | 'longBreak';
+import { computeEndTime, computeRemainingSeconds, formatTime, type Durations, type TimerMode } from './lib/timer';
+import { createEmptyStats, getTodayKey, incrementFocusSession, type TodayStats } from './lib/stats';
+import { loadDurations, loadStats, saveDurations, saveStats } from './lib/storage';
 
 interface ModeConfig {
   label: string;
@@ -8,12 +10,6 @@ interface ModeConfig {
   color: string;
   bgGradient: string;
   icon: string;
-}
-
-interface TodayStats {
-  date: string;
-  focusSessions: number;
-  totalFocusMinutes: number;
 }
 
 const MODE_CONFIG: Record<TimerMode, ModeConfig> = {
@@ -40,104 +36,118 @@ const MODE_CONFIG: Record<TimerMode, ModeConfig> = {
   },
 };
 
-function getTodayKey(): string {
-  const today = new Date();
-  const year = today.getFullYear();
-  const month = String(today.getMonth() + 1).padStart(2, '0');
-  const day = String(today.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
-
-function loadStats(): TodayStats {
-  const today = getTodayKey();
-  const stored = localStorage.getItem('pomodoro-stats');
-  if (stored) {
-    const parsed = JSON.parse(stored) as TodayStats;
-    if (parsed.date === today) {
-      return parsed;
-    }
-  }
-  return { date: today, focusSessions: 0, totalFocusMinutes: 0 };
-}
-
-function saveStats(stats: TodayStats) {
-  localStorage.setItem('pomodoro-stats', JSON.stringify(stats));
-}
-
-function loadCustomDurations(): Record<TimerMode, number> {
-  const stored = localStorage.getItem('pomodoro-durations');
-  if (stored) {
-    return JSON.parse(stored);
-  }
-  return {
-    focus: 25,
-    shortBreak: 5,
-    longBreak: 15,
-  };
-}
-
-function saveCustomDurations(durations: Record<TimerMode, number>) {
-  localStorage.setItem('pomodoro-durations', JSON.stringify(durations));
-}
-
-function formatTime(seconds: number): string {
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-}
-
 export default function App() {
   const [mode, setMode] = useState<TimerMode>('focus');
-  const [customDurations, setCustomDurations] = useState<Record<TimerMode, number>>(loadCustomDurations);
+  const [customDurations, setCustomDurations] = useState<Durations>(loadDurations);
   const [timeLeft, setTimeLeft] = useState(customDurations.focus * 60);
   const [isRunning, setIsRunning] = useState(false);
   const [stats, setStats] = useState<TodayStats>(loadStats);
   const [showSettings, setShowSettings] = useState(false);
-  const [tempDurations, setTempDurations] = useState<Record<TimerMode, number>>(customDurations);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [tempDurations, setTempDurations] = useState<Durations>(customDurations);
+  // Wall-clock deadline (ms epoch) for the running countdown; null when paused.
+  const endTimeRef = useRef<number | null>(null);
   const completedRef = useRef(false);
 
-  // Timer logic
+  // Reliable countdown: remaining time is always recomputed from the
+  // wall-clock deadline, so background tabs, throttled timers and system
+  // sleep cannot make the timer drift.
   useEffect(() => {
-    if (isRunning && timeLeft > 0) {
-      intervalRef.current = setInterval(() => {
-        setTimeLeft((prev) => prev - 1);
-      }, 1000);
-    } else if (timeLeft === 0 && isRunning) {
-      setIsRunning(false);
-      completedRef.current = true;
-      // If focus session completed, update stats
-      if (mode === 'focus') {
-        const newStats = {
-          ...stats,
-          focusSessions: stats.focusSessions + 1,
-          totalFocusMinutes: stats.totalFocusMinutes + customDurations.focus,
-        };
-        setStats(newStats);
-        saveStats(newStats);
-      }
-      // Play notification sound effect (visual flash)
-      document.title = `✅ ${MODE_CONFIG[mode].label}完成！ - 番茄專注計時器`;
+    if (!isRunning) {
+      return;
     }
 
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
+    const sync = () => {
+      const endTime = endTimeRef.current;
+      if (endTime === null) {
+        return;
+      }
+      const remaining = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
+      setTimeLeft(remaining);
+      if (remaining === 0) {
+        endTimeRef.current = null;
+        setIsRunning(false);
       }
     };
-  }, [isRunning, timeLeft, mode, stats, customDurations.focus]);
+
+    sync();
+    const intervalId = window.setInterval(sync, 250);
+    const resync = () => {
+      if (!document.hidden) {
+        sync();
+      }
+    };
+    document.addEventListener('visibilitychange', resync);
+    window.addEventListener('focus', resync);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', resync);
+      window.removeEventListener('focus', resync);
+    };
+  }, [isRunning]);
+
+  // Persist stats whenever they change (also heals corrupted storage).
+  useEffect(() => {
+    saveStats(stats);
+  }, [stats]);
+
+  // Reset "today" stats when the calendar day changes while the page stays open.
+  useEffect(() => {
+    const checkDateRollover = () => {
+      const today = getTodayKey();
+      setStats((prev) => (prev.date === today ? prev : createEmptyStats(today)));
+    };
+
+    checkDateRollover();
+    const intervalId = window.setInterval(checkDateRollover, 30_000);
+    const resync = () => {
+      if (!document.hidden) {
+        checkDateRollover();
+      }
+    };
+    document.addEventListener('visibilitychange', resync);
+    window.addEventListener('focus', resync);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', resync);
+      window.removeEventListener('focus', resync);
+    };
+  }, []);
+
+  // Session completion: fires exactly once when the countdown reaches 00:00.
+  useEffect(() => {
+    if (timeLeft !== 0) {
+      completedRef.current = false;
+      return;
+    }
+    if (completedRef.current) {
+      return;
+    }
+    completedRef.current = true;
+    setIsRunning(false);
+    endTimeRef.current = null;
+
+    // Focus sessions are counted here; incrementFocusSession rolls over to a
+    // fresh record automatically when the day changed during the session.
+    if (mode === 'focus') {
+      setStats((prev) => incrementFocusSession(prev, customDurations.focus));
+    }
+  }, [timeLeft, mode, customDurations.focus]);
 
   // Update document title with timer
   useEffect(() => {
     if (isRunning) {
       document.title = `${formatTime(timeLeft)} - ${MODE_CONFIG[mode].label}中`;
-    } else if (!completedRef.current) {
+    } else if (timeLeft === 0) {
+      document.title = `✅ ${MODE_CONFIG[mode].label}完成！ - 番茄專注計時器`;
+    } else {
       document.title = '番茄專注計時器';
     }
-    completedRef.current = false;
   }, [timeLeft, isRunning, mode]);
 
   const handleModeChange = useCallback((newMode: TimerMode) => {
+    endTimeRef.current = null;
     setMode(newMode);
     setTimeLeft(customDurations[newMode] * 60);
     setIsRunning(false);
@@ -145,18 +155,29 @@ export default function App() {
 
   const handleStart = () => {
     if (timeLeft > 0) {
+      endTimeRef.current = Date.now() + timeLeft * 1000;
       setIsRunning(true);
     }
   };
-  const handlePause = () => setIsRunning(false);
+  const handlePause = () => {
+    const endTime = endTimeRef.current;
+    if (endTime !== null) {
+      setTimeLeft(Math.max(0, Math.ceil((endTime - Date.now()) / 1000)));
+    }
+    endTimeRef.current = null;
+    setIsRunning(false);
+  };
   const handleReset = () => {
+    endTimeRef.current = null;
+    completedRef.current = false;
     setIsRunning(false);
     setTimeLeft(customDurations[mode] * 60);
   };
 
   const handleSaveSettings = () => {
+    endTimeRef.current = null;
     setCustomDurations(tempDurations);
-    saveCustomDurations(tempDurations);
+    saveDurations(tempDurations);
     setTimeLeft(tempDurations[mode] * 60);
     setIsRunning(false);
     setShowSettings(false);
@@ -167,7 +188,10 @@ export default function App() {
     setShowSettings(true);
   };
 
-  const progress = 1 - timeLeft / (customDurations[mode] * 60);
+  const totalSeconds = customDurations[mode] * 60;
+  const progress = totalSeconds > 0
+    ? Math.min(1, Math.max(0, 1 - timeLeft / totalSeconds))
+    : 0;
   const circumference = 2 * Math.PI * 120;
   const strokeDashoffset = circumference * (1 - progress);
 
